@@ -1,0 +1,55 @@
+name: build-mac
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  mac-build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Homebrew deps (Firefox/Gecko)
+        run: |
+          brew update
+          brew install --cask firefox
+          brew install geckodriver
+          # convert icon if you have only .png
+          # brew install imagemagick
+          # convert assets/icon.png assets/icon.icns
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build macOS app with PyInstaller
+        run: |
+          pyinstaller \
+            --noconfirm \
+            --windowed \
+            --name "LeaDMify Agent" \
+            --icon assets/icon.icns \
+            --add-data "ibot_hub.py:." \
+            LeaDMifyAgent_mac.py
+
+      - name: Create DMG
+        run: |
+          mkdir -p dist/dmg
+          hdiutil create dist/LeaDMifyAgent.dmg -volname "LeaDMify Agent" -srcfolder "dist/LeaDMify Agent.app" -ov -format UDZO
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeaDMifyAgent-mac
+          path: |
+            dist/LeaDMifyAgent.dmg
+            dist/LeaDMify\ Agent.app
