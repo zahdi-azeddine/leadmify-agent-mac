@@ -6,21 +6,22 @@ on:
 
 jobs:
   mac-build:
-    runs-on: macos-latest
+    strategy:
+      matrix:
+        os: [macos-13, macos-14]   # macos-13 = Intel x86_64, macos-14 = Apple Silicon arm64
+    runs-on: ${{ matrix.os }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Homebrew deps (Firefox/Gecko)
+      - name: Install Firefox + Geckodriver
         run: |
           brew update
           brew install --cask firefox
           brew install geckodriver
-          # convert icon if you have only .png
-          # brew install imagemagick
-          # convert assets/icon.png assets/icon.icns
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -37,19 +38,19 @@ jobs:
             --noconfirm \
             --windowed \
             --name "LeaDMify Agent" \
-            --icon assets/icon.icns \
+            --icon "assets/icon.icns" \
             --add-data "ibot_hub.py:." \
             LeaDMifyAgent_mac.py
 
-      - name: Create DMG
+      - name: Create DMG and zip .app
         run: |
-          mkdir -p dist/dmg
-          hdiutil create dist/LeaDMifyAgent.dmg -volname "LeaDMify Agent" -srcfolder "dist/LeaDMify Agent.app" -ov -format UDZO
+          ditto -c -k --sequesterRsrc --keepParent "dist/LeaDMify Agent.app" "dist/LeaDMifyAgent.${{ matrix.os }}.app.zip"
+          hdiutil create "dist/LeaDMifyAgent.${{ matrix.os }}.dmg" -volname "LeaDMify Agent" -srcfolder "dist/LeaDMify Agent.app" -ov -format UDZO
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: LeaDMifyAgent-mac
+          name: LeaDMifyAgent-${{ matrix.os }}
           path: |
-            dist/LeaDMifyAgent.dmg
-            dist/LeaDMify\ Agent.app
+            dist/LeaDMifyAgent.${{ matrix.os }}.dmg
+            dist/LeaDMifyAgent.${{ matrix.os }}.app.zip
