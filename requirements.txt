@@ -2,3 +2,4 @@ requests
 selenium
 pyperclip
 pyobjc
+certifi

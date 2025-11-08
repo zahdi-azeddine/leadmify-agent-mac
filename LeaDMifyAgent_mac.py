@@ -75,13 +75,18 @@ class AgentApp(tk.Tk):
 
     def validate_token(self, token: str) -> (bool, str):
         """Ping an endpoint with Bearer token; 200=valid, 401=invalid."""
+        import ssl, certifi, urllib.request, urllib.error
+        ctx = ssl.create_default_context(cafile=certifi.where())
         try:
             req = urllib.request.Request(
                 API_BASE_URL + "/api/campaigns",
                 method="GET",
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json"
+                },
             )
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
                 code = resp.getcode()
                 if 200 <= code < 300:
                     return True, "OK"
@@ -92,6 +97,7 @@ class AgentApp(tk.Tk):
             return False, f"HTTP {e.code}"
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
+
 
     def _engine_loop(self, token: str):
         """Run your monitoring loop until stop_flag is set."""

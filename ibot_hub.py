@@ -423,6 +423,8 @@ class IBotAutomation:
     def _init_session(self):
         """Initialize requests session with retry strategy"""
         self.session = requests.Session()
+        import certifi
+        self.session.verify = certifi.where()
         
         try:
             from requests.adapters import HTTPAdapter
