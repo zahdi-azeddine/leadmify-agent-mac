@@ -27,6 +27,7 @@ import re
 import shutil
 import uuid
 import platform
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from selenium import webdriver
@@ -1264,26 +1265,92 @@ class IBotAutomation:
     # MESSAGE SENDING
     # ========================================================================
     
-    def type_message(self, element, message):
-        """Paste message into element — compatible with Windows and macOS."""
+def _set_clipboard_macos(text: str) -> bool:
+    """Put UTF-8 text on macOS clipboard using AppKit, fallback to pbcopy."""
+    try:
+        from AppKit import NSPasteboard, NSPasteboardTypeString  # pip install pyobjc
+        pb = NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(text, NSPasteboardTypeString)
+        return True
+    except Exception:
         try:
-            system = platform.system()
+            p = subprocess.Popen(["/usr/bin/pbcopy"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return p.returncode == 0
+        except Exception:
+            return False
 
-            # Copy the message to clipboard
-            pyperclip.copy(message)
-            time.sleep(0.5)
+    def type_message(driver, element, message: str):
+        """
+        Paste/insert a message safely (UTF-8) on Windows & macOS.
+        - macOS: normalize to NFC, prefer AppKit pasteboard; fallback pbcopy; ⌘V
+        - Windows/Linux: Ctrl+V as usual
+        - If the target is contenteditable/React-like, try JS insertion first.
+        """
+        # 1) Normalize text (fix accents/Arabic combining marks)
+        message = unicodedata.normalize("NFC", str(message))
 
-            # Use the correct key combo for the OS
+        # 2) Ensure focus
+        WebDriverWait(driver, 10).until(lambda d: element.is_displayed() and element.is_enabled())
+        element.click()
+        time.sleep(0.1)
+
+        # 3) Prefer direct JS insert for contenteditable (avoids clipboard issues)
+        try:
+            is_editable = (element.get_attribute("contenteditable") or "").lower() == "true"
+            if is_editable:
+                driver.execute_script(
+                    """
+                    const el = arguments[0], txt = arguments[1];
+                    el.focus();
+                    // Clear then insert plain text
+                    if (window.getSelection && document.createRange) {
+                        const sel = window.getSelection();
+                        sel.removeAllRanges();
+                        const range = document.createRange();
+                        range.selectNodeContents(el);
+                        sel.addRange(range);
+                    }
+                    document.execCommand('insertText', false, txt);
+                    // Fire input event for React/Vue
+                    el.dispatchEvent(new Event('input', {bubbles: true}));
+                    """,
+                    element, message
+                )
+                return
+        except Exception:
+            pass  # If JS path fails, fall back to clipboard paste below.
+
+        # 4) Clipboard path
+        system = platform.system()
+        try:
             if system == "Darwin":  # macOS
-                element.send_keys(Keys.COMMAND, 'v')
-            else:  # Windows / Linux
-                element.send_keys(Keys.CONTROL, 'v')
-
-            time.sleep(0.5)
-
+                if not _set_clipboard_macos(message):
+                    raise RuntimeError("Could not set clipboard on macOS")
+                time.sleep(0.1)
+                element.send_keys(Keys.COMMAND, "v")
+            else:
+                # Windows/Linux: keep pyperclip or your existing method
+                try:
+                    import pyperclip
+                    pyperclip.copy(message)
+                except Exception:
+                    # last-resort: no pyperclip
+                    pass
+                time.sleep(0.1)
+                element.send_keys(Keys.CONTROL, "v")
+            time.sleep(0.1)
         except Exception as e:
-            print(f"Error while pasting message: {e}")
-
+            print(f"[type_message] Paste failed, last error: {e}")
+            # 5) Last fallback: type characters directly (slow but safe)
+            try:
+                element.clear()
+            except Exception:
+                pass
+            for chunk in message.split("\n"):
+                element.send_keys(chunk)
+                element.send_keys(Keys.SHIFT, Keys.ENTER)  # keep line breaks without sending
 
     def send_message(self, driver, user, message, campaign_id, profile_id, counters):
         """Send message to user"""
@@ -1323,7 +1390,7 @@ class IBotAutomation:
             # Try 3 methods to select user
             user_clicked = False
             
-            # Method 1: Exactt match
+            # Method 1: Exact match
             try:
                 safe_print(f"Looking for user: {user}", "🔍", "INFO")
                 username_span = WebDriverWait(driver, 12).until(
