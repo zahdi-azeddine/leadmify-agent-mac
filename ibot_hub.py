@@ -1323,7 +1323,7 @@ class IBotAutomation:
             # Try 3 methods to select user
             user_clicked = False
             
-            # Method 1: Exact match
+            # Method 1: Exactt match
             try:
                 safe_print(f"Looking for user: {user}", "🔍", "INFO")
                 username_span = WebDriverWait(driver, 12).until(
