@@ -1267,23 +1267,23 @@ class IBotAutomation:
     # MESSAGE SENDING
     # ========================================================================
     
-def _set_clipboard_macos(text: str) -> bool:
-    """Put UTF-8 text on macOS clipboard using AppKit, fallback to pbcopy."""
-    try:
-        from AppKit import NSPasteboard, NSPasteboardTypeString  # pip install pyobjc
-        pb = NSPasteboard.generalPasteboard()
-        pb.clearContents()
-        pb.setString_forType_(text, NSPasteboardTypeString)
-        return True
-    except Exception:
+    def _set_clipboard_macos(self, text: str) -> bool:
+        """Put UTF-8 text on macOS clipboard using AppKit, fallback to pbcopy."""
         try:
-            p = subprocess.Popen(["/usr/bin/pbcopy"], stdin=subprocess.PIPE)
-            p.communicate(text.encode("utf-8"))
-            return p.returncode == 0
+            from AppKit import NSPasteboard, NSPasteboardTypeString  # pip install pyobjc
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            pb.setString_forType_(text, NSPasteboardTypeString)
+            return True
         except Exception:
-            return False
+            try:
+                p = subprocess.Popen(["/usr/bin/pbcopy"], stdin=subprocess.PIPE)
+                p.communicate(text.encode("utf-8"))
+                return p.returncode == 0
+            except Exception:
+                return False
 
-    def type_message(driver, element, message: str):
+    def type_message(self, driver, element, message: str):
         """
         Paste/insert a message safely (UTF-8) on Windows & macOS.
         - macOS: normalize to NFC, prefer AppKit pasteboard; fallback pbcopy; ⌘V
@@ -1328,7 +1328,7 @@ def _set_clipboard_macos(text: str) -> bool:
         system = platform.system()
         try:
             if system == "Darwin":  # macOS
-                if not _set_clipboard_macos(message):
+                if not self._set_clipboard_macos(message):
                     raise RuntimeError("Could not set clipboard on macOS")
                 time.sleep(0.1)
                 element.send_keys(Keys.COMMAND, "v")
@@ -1470,7 +1470,7 @@ def _set_clipboard_macos(text: str) -> bool:
                 )
                 
                 personalized_message = message.replace("{username}", user)
-                self.type_message(message_input, personalized_message)
+                self.type_message(driver, message_input, personalized_message)
                 safe_print(f"Message typed for: {user}", "✅", "INFO")
                 time.sleep(1)
             except TimeoutException:
