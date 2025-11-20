@@ -3,3 +3,4 @@ selenium
 pyperclip
 pyobjc
 certifi
+python-socketio[client]

@@ -28,6 +28,7 @@ import shutil
 import uuid
 import platform
 import unicodedata
+import socketio
 from datetime import datetime
 from pathlib import Path
 from selenium import webdriver
@@ -75,7 +76,8 @@ if sys.platform == "win32":
 class Config:
     """Centralized configuration"""
     API_BASE_URL = "https://api.leadmify.com"
-    MONITOR_INTERVAL = 15
+    WS_BASE_URL = "https://api.leadmify.com"  # WebSocket base URL
+    MONITOR_INTERVAL = 30  # Fallback polling interval (only used if WebSocket fails)
     MAX_RETRIES_PROFILE = 3
     MAX_RETRIES_API = 5
     API_TIMEOUT = 30
@@ -83,6 +85,7 @@ class Config:
     MAX_CONNECTION_FAILURES = 10
     BACKOFF_BASE = 2
     MAX_BACKOFF = 300
+    WS_RECONNECT_DELAY = 5  # Delay before reconnecting WebSocket
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -401,9 +404,17 @@ class IBotAutomation:
     
     def __init__(self, api_base_url=None, token=None):
         self.api_base_url = api_base_url or Config.API_BASE_URL
+        self.ws_base_url = Config.WS_BASE_URL
         self.token = token
         self.session = None
         self._init_session()
+        
+        # WebSocket client
+        self.sio = None
+        self.ws_connected = False
+        self.ws_reconnect_attempts = 0
+        self.ws_max_reconnect_attempts = 10
+        self.ws_lock = threading.Lock()
         
         self.running = True
         self.global_stop = False
@@ -414,9 +425,13 @@ class IBotAutomation:
         
         self.campaign_lock = threading.Lock()
         self.connection_lock = threading.Lock()
+        self.profile_lock = threading.Lock()  # Lock for profile opening operations
         
         self.connection_failures = 0
         self.last_connection_check = time.time()
+        
+        # Initialize WebSocket connection
+        self._init_websocket()
         
         safe_print("Automation initialized successfully", "✅", "INFO")
     
@@ -456,6 +471,217 @@ class IBotAutomation:
                 'Authorization': f'Bearer {self.token}',
                 'Content-Type': 'application/json'
             })
+    
+    def _init_websocket(self):
+        """Initialize WebSocket connection using Socket.IO"""
+        try:
+            self.sio = socketio.Client(
+                reconnection=True,
+                reconnection_attempts=self.ws_max_reconnect_attempts,
+                reconnection_delay=Config.WS_RECONNECT_DELAY,
+                logger=False,
+                engineio_logger=False
+            )
+            
+            # Set up event handlers
+            @self.sio.event
+            def connect():
+                with self.ws_lock:
+                    self.ws_connected = True
+                    self.ws_reconnect_attempts = 0
+                safe_print("WebSocket connected", "✅", "INFO")
+                
+                # Authenticate with token - wait a moment for namespace to be fully ready
+                if self.token:
+                    def authenticate():
+                        try:
+                            # Double-check connection is still active
+                            if hasattr(self, 'sio') and self.sio and self.sio.connected:
+                                self.sio.emit('authenticate_agent', {'token': self.token})
+                        except Exception as e:
+                            # Silently handle - connection might have dropped
+                            pass
+                    # Use a small delay to ensure namespace is fully connected
+                    threading.Timer(0.2, authenticate).start()
+            
+            @self.sio.event
+            def disconnect():
+                with self.ws_lock:
+                    self.ws_connected = False
+                safe_print("WebSocket disconnected", "⚠️", "WARNING")
+            
+            @self.sio.event
+            def connect_error(data):
+                safe_print(f"WebSocket connection error: {str(data)[:100]}", "❌", "ERROR")
+            
+            @self.sio.event
+            def authentication_success(data):
+                safe_print("WebSocket authentication successful", "✅", "SUCCESS")
+                # Request initial state
+                self.sio.emit('agent_ready')
+            
+            @self.sio.event
+            def authentication_failed(data):
+                safe_print("WebSocket authentication failed", "❌", "ERROR")
+                self.global_stop = True
+            
+            # Campaign events
+            @self.sio.on('campaign_started')
+            def on_campaign_started(data):
+                """Handle new campaign started event"""
+                try:
+                    campaign_id = data.get('campaign_id')
+                    if campaign_id and campaign_id not in self.active_campaigns:
+                        safe_print(f"New campaign started via WebSocket: {campaign_id}", "🚀", "INFO")
+                        self._handle_campaign_start(campaign_id)
+                except Exception as e:
+                    safe_print(f"Error handling campaign_started: {str(e)}", "❌", "ERROR")
+            
+            @self.sio.on('campaign_stopped')
+            def on_campaign_stopped(data):
+                """Handle campaign stopped event"""
+                try:
+                    campaign_id = data.get('campaign_id')
+                    if campaign_id:
+                        safe_print(f"Campaign stopped via WebSocket: {campaign_id}", "⚠️", "WARNING")
+                        with self.campaign_lock:
+                            if campaign_id in self.active_campaigns:
+                                self.active_campaigns[campaign_id]['stop'] = True
+                        self.close_campaign_profiles(campaign_id)
+                except Exception as e:
+                    safe_print(f"Error handling campaign_stopped: {str(e)}", "❌", "ERROR")
+            
+            # Unread check request events
+            @self.sio.on('unread_check_request')
+            def on_unread_check_request(data):
+                """Handle new unread check request event"""
+                try:
+                    request_id = data.get('request_id')
+                    profile_ids = data.get('profile_ids')
+                    if request_id:
+                        safe_print(f"New unread check request via WebSocket: {request_id}", "📬", "INFO")
+                        thread = threading.Thread(
+                            target=self.execute_unread_check,
+                            args=(request_id, profile_ids)
+                        )
+                        thread.daemon = True
+                        thread.start()
+                except Exception as e:
+                    safe_print(f"Error handling unread_check_request: {str(e)}", "❌", "ERROR")
+            
+            # Profile request events
+            @self.sio.on('profile_request')
+            def on_profile_request(data):
+                """Handle new profile request event"""
+                try:
+                    request_id = data.get('request_id')
+                    if request_id and request_id not in self.processed_requests:
+                        safe_print(f"New profile request via WebSocket: {request_id}", "🦊", "INFO")
+                        self.processed_requests.add(request_id)
+                        thread = threading.Thread(
+                            target=self.execute_profile_request,
+                            args=(
+                                request_id,
+                                data.get('profile_path'),
+                                data.get('profile_name'),
+                                data.get('request_type', 'open')
+                            )
+                        )
+                        thread.daemon = True
+                        thread.start()
+                except Exception as e:
+                    safe_print(f"Error handling profile_request: {str(e)}", "❌", "ERROR")
+            
+            # Firefox profile request events
+            @self.sio.on('firefox_profile_request')
+            def on_firefox_profile_request(data):
+                """Handle new Firefox profile request event"""
+                try:
+                    request_id = data.get('request_id')
+                    if request_id and request_id not in self.processed_requests:
+                        safe_print(f"New Firefox profile request via WebSocket: {request_id}", "🦊", "INFO")
+                        self.processed_requests.add(request_id)
+                        thread = threading.Thread(
+                            target=self.execute_firefox_profile_request,
+                            args=(
+                                request_id,
+                                data.get('request_type'),
+                                data.get('profile_name'),
+                                data.get('profile_path'),
+                                data.get('is_default', False)
+                            )
+                        )
+                        thread.daemon = True
+                        thread.start()
+                except Exception as e:
+                    safe_print(f"Error handling firefox_profile_request: {str(e)}", "❌", "ERROR")
+            
+            # Connect to WebSocket server
+            try:
+                self.sio.connect(
+                    self.ws_base_url,
+                    headers={'Authorization': f'Bearer {self.token}'},
+                    wait_timeout=10
+                )
+            except Exception as e:
+                safe_print(f"Failed to connect WebSocket: {str(e)[:100]}", "⚠️", "WARNING")
+                safe_print("Falling back to polling mode", "ℹ️", "INFO")
+                self.ws_connected = False
+                
+        except Exception as e:
+            safe_print(f"Error initializing WebSocket: {str(e)[:100]}", "❌", "ERROR")
+            safe_print("Falling back to polling mode", "ℹ️", "INFO")
+            self.ws_connected = False
+    
+    def _handle_campaign_start(self, campaign_id):
+        """Handle campaign start event"""
+        try:
+            safe_print(f"Starting campaign {campaign_id}", "🚀", "INFO")
+            
+            thread = threading.Thread(
+                target=self.run_campaign_thread,
+                args=(campaign_id,)
+            )
+            thread.daemon = True
+            thread.start()
+            
+            with self.campaign_lock:
+                self.active_campaigns[campaign_id] = {
+                    'thread': thread,
+                    'drivers': [],
+                    'stop': False
+                }
+        except Exception as e:
+            safe_print(f"Error starting campaign: {str(e)}", "❌", "ERROR")
+    
+    def _reconnect_websocket(self):
+        """Reconnect WebSocket if disconnected"""
+        if self.global_stop:
+            return
+        
+        with self.ws_lock:
+            if not self.ws_connected and self.sio:
+                try:
+                    if not self.sio.connected:
+                        safe_print("Reconnecting WebSocket...", "🔄", "INFO")
+                        # Disconnect first if partially connected
+                        try:
+                            self.sio.disconnect()
+                        except:
+                            pass
+                        # Wait a bit before reconnecting
+                        time.sleep(1)
+                        self.sio.connect(
+                            self.ws_base_url,
+                            headers={'Authorization': f'Bearer {self.token}'},
+                            wait_timeout=10
+                        )
+                except Exception as e:
+                    self.ws_reconnect_attempts += 1
+                    if self.ws_reconnect_attempts < self.ws_max_reconnect_attempts:
+                        safe_print(f"WebSocket reconnect attempt {self.ws_reconnect_attempts} failed", "⚠️", "WARNING")
+                    else:
+                        safe_print("Max WebSocket reconnect attempts reached, using polling fallback", "⚠️", "WARNING")
     
     # ========================================================================
     # CONNECTION MANAGEMENT
@@ -924,45 +1150,77 @@ class IBotAutomation:
         """Execute profile opening or closing request"""
         try:
             if request_type == 'open':
-                # Check if profile is already open
-                if self._is_profile_already_open(profile_path):
-                    safe_print(f"Profile {profile_name} is already opened.", "ℹ️", "INFO")
-                    self.update_profile_request_status(request_id, 'completed')
-                    return True
+                # Thread-safe check and mark as opening
+                with self.profile_lock:
+                    # Check if profile is already open or being opened
+                    if profile_path in self.open_profiles:
+                        if self._is_profile_already_open(profile_path):
+                            safe_print(f"Profile {profile_name} is already opened.", "ℹ️", "INFO")
+                            self.update_profile_request_status(request_id, 'completed')
+                            return True
+                        else:
+                            # Profile was tracked but not actually open, remove from tracking
+                            self.open_profiles.discard(profile_path)
+                    
+                    # Mark as being opened (atomic operation)
+                    if profile_path in self.open_profiles:
+                        safe_print(f"Profile {profile_name} is already being opened by another thread.", "ℹ️", "INFO")
+                        self.update_profile_request_status(request_id, 'completed')
+                        return True
+                    
+                    # Add to tracking BEFORE opening to prevent race conditions
+                    self.open_profiles.add(profile_path)
                 
                 safe_print(f"Opening profile: {profile_name}", "🦊", "INFO")
                 
                 # Update status to running
                 self.update_profile_request_status(request_id, 'running')
                 
-                # Open Firefox profile
-                options = Options()
-                options.add_argument("-profile")
-                options.add_argument(profile_path)
-                options.set_preference("dom.webdriver.enabled", False)
-                options.set_preference('useAutomationExtension', False)
+                # Open Firefox profile with retry logic
+                max_retries = 3
+                retry_count = 0
+                driver = None
                 
-                try:
-                    driver = webdriver.Firefox(options=options)
-                    driver.get("https://www.instagram.com")
-                    
-                    # Minimize window if on Windows
-                    if sys.platform == "win32":
-                        try:
-                            self._minimize_firefox_windows()
-                        except:
-                            pass
-                    
-                    safe_print(f"Profile opened successfully: {profile_name}", "✅", "SUCCESS")
-                    self.update_profile_request_status(request_id, 'completed')
-                    
-                    # Keep the driver alive (don't quit it)
-                    return True
-                    
-                except Exception as e:
-                    safe_print(f"Failed to open profile {profile_name}: {str(e)}", "❌", "ERROR")
-                    self.update_profile_request_status(request_id, 'failed', error=str(e))
-                    return False
+                while retry_count < max_retries:
+                    try:
+                        options = Options()
+                        options.add_argument("-profile")
+                        options.add_argument(profile_path)
+                        options.set_preference("dom.webdriver.enabled", False)
+                        options.set_preference('useAutomationExtension', False)
+                        
+                        driver = webdriver.Firefox(options=options)
+                        driver.get("https://www.instagram.com")
+                        
+                        safe_print(f"Profile opened successfully: {profile_name}", "✅", "SUCCESS")
+                        self.update_profile_request_status(request_id, 'completed')
+                        
+                        # Keep the driver alive (don't quit it)
+                        return True
+                        
+                    except Exception as e:
+                        retry_count += 1
+                        error_msg = str(e)
+                        
+                        # Check if profile is actually in use
+                        if "profile" in error_msg.lower() and ("already" in error_msg.lower() or "in use" in error_msg.lower() or "locked" in error_msg.lower()):
+                            safe_print(f"Profile {profile_name} is already in use (detected).", "ℹ️", "INFO")
+                            self.update_profile_request_status(request_id, 'completed')
+                            with self.profile_lock:
+                                # Keep it in open_profiles since it's actually open
+                                self.open_profiles.add(profile_path)
+                            return True
+                        
+                        if retry_count < max_retries:
+                            safe_print(f"Failed to open profile {profile_name} (attempt {retry_count}/{max_retries}): {error_msg[:100]}", "⚠️", "WARNING")
+                            time.sleep(2)  # Wait before retry
+                        else:
+                            safe_print(f"Failed to open profile {profile_name} after {max_retries} attempts: {error_msg[:100]}", "❌", "ERROR")
+                            self.update_profile_request_status(request_id, 'failed', error=error_msg[:200])
+                            # Remove from tracking if we failed
+                            with self.profile_lock:
+                                self.open_profiles.discard(profile_path)
+                            return False
                     
             elif request_type == 'close':
                 safe_print(f"Closing profile: {profile_name}", "🦊", "INFO")
@@ -970,12 +1228,25 @@ class IBotAutomation:
                 # Update status to running
                 self.update_profile_request_status(request_id, 'running')
                 
+                # Remove from tracking BEFORE closing (thread-safe)
+                with self.profile_lock:
+                    self.open_profiles.discard(profile_path)
+                
                 try:
                     # Close Firefox processes for this profile
                     if sys.platform == "win32":
-                        # Windows: Kill Firefox processes
-                        subprocess.run(['taskkill', '/F', '/IM', 'firefox.exe'], 
-                                     capture_output=True, text=True)
+                        # Windows: Kill Firefox processes for this specific profile
+                        # First try to find and kill processes using this profile
+                        try:
+                            result = subprocess.run(['wmic', 'process', 'where', 'name="firefox.exe"', 'get', 'commandline'], 
+                                                  capture_output=True, text=True, timeout=5)
+                            if profile_path in result.stdout:
+                                subprocess.run(['taskkill', '/F', '/IM', 'firefox.exe'], 
+                                             capture_output=True, text=True)
+                        except:
+                            # Fallback: kill all Firefox processes
+                            subprocess.run(['taskkill', '/F', '/IM', 'firefox.exe'], 
+                                         capture_output=True, text=True)
                     else:
                         # Linux/Mac: Kill Firefox processes
                         subprocess.run(['pkill', '-f', 'firefox'], 
@@ -1023,12 +1294,19 @@ class IBotAutomation:
                 if status in ['completed', 'failed']:
                     self.processed_requests.discard(request_id)
                 return True
+            elif response.status_code == 404:
+                # Request might have been cleaned up or doesn't exist - this is okay
+                safe_print(f"Profile request {request_id} not found (may have been cleaned up)", "ℹ️", "INFO")
+                # Remove from processed requests anyway
+                if status in ['completed', 'failed']:
+                    self.processed_requests.discard(request_id)
+                return True  # Treat as success since it's likely already processed
             else:
-                safe_print(f"Failed to update profile request {request_id}: {response.status_code}", "⚠️", "WARNING")
+                safe_print(f"Failed to update profile request {request_id}: {response.status_code} - {response.text[:100]}", "⚠️", "WARNING")
                 return False
                 
         except Exception as e:
-            safe_print(f"Error updating profile request status: {str(e)}", "❌", "ERROR")
+            safe_print(f"Error updating profile request status: {str(e)[:100]}", "❌", "ERROR")
             return False
     
     def execute_firefox_profile_request(self, request_id, request_type, profile_name=None, profile_path=None, is_default=False):
@@ -1141,40 +1419,20 @@ class IBotAutomation:
             
             for driver in drivers[:]:
                 try:
-                    # Note: We can't easily determine which profile path this driver used
-                    # So we'll let the individual profile cleanup handle the tracking
                     driver.quit()
                     closed_count += 1
                 except Exception:
                     pass
+            
+            # Note: Profile tracking cleanup is handled by individual run_profile cleanup
+            # This ensures proper thread-safe cleanup when each profile thread finishes
             
             safe_print(f"Closed {closed_count}/{len(drivers)} profile(s)", "✅", "INFO")
             campaign_info['drivers'] = []
     
     def create_firefox_driver(self, profile_path):
         """Create Firefox driver"""
-        # Check if profile is already open first
-        if self._is_profile_already_open(profile_path):
-            safe_print(f"Profile {profile_path} is already open, attempting to connect to existing instance", "ℹ️", "INFO")
-            
-            # Try to connect to existing Firefox instance
-            try:
-                # Create a new driver that connects to the existing Firefox instance
-                options = Options()
-                options.add_argument("-profile")
-                options.add_argument(profile_path)
-                options.set_preference("dom.webdriver.enabled", False)
-                options.set_preference('useAutomationExtension', False)
-                options.add_argument("--connect-existing")  # Try to connect to existing instance
-                
-                driver = webdriver.Firefox(options=options)
-                safe_print(f"Successfully connected to existing profile: {profile_path}", "✅", "SUCCESS")
-                return driver
-            except Exception as e:
-                safe_print(f"Could not connect to existing instance: {str(e)[:50]}", "⚠️", "WARNING")
-                safe_print("Will create new instance instead", "ℹ️", "INFO")
-        
-        # Create new Firefox driver
+        # Create new Firefox driver (profile locking is handled by caller)
         options = Options()
         options.add_argument("-profile")
         options.add_argument(profile_path)
@@ -1183,15 +1441,15 @@ class IBotAutomation:
         
         try:
             driver = webdriver.Firefox(options=options)
-            
-            if sys.platform == "win32":
-                try:
-                    self._minimize_firefox_windows()
-                except:
-                    pass
-            
             return driver
-        except Exception:
+        except Exception as e:
+            error_msg = str(e).lower()
+            # Check if it's a profile-in-use error
+            if "profile" in error_msg and ("already" in error_msg or "in use" in error_msg or "locked" in error_msg):
+                # Re-raise as ProfileException so caller knows it's already in use
+                raise ProfileException(f"Profile is already in use: {str(e)[:100]}")
+            
+            # Try with explicit geckodriver path
             from selenium.webdriver.firefox.service import Service
             
             geckodriver_paths = [
@@ -1203,10 +1461,14 @@ class IBotAutomation:
             
             for path in geckodriver_paths:
                 if os.path.exists(path):
-                    service = Service(path)
-                    return webdriver.Firefox(service=service, options=options)
+                    try:
+                        service = Service(path)
+                        driver = webdriver.Firefox(service=service, options=options)
+                        return driver
+                    except:
+                        continue
             
-            raise ProfileException("Failed to create Firefox driver")
+            raise ProfileException(f"Failed to create Firefox driver: {str(e)[:100]}")
     
     def _is_profile_already_open(self, profile_path):
         """Check if a Firefox profile is already open"""
@@ -1251,17 +1513,6 @@ class IBotAutomation:
         except Exception:
             return False  # If we can't determine, assume not open
     
-    def _minimize_firefox_windows(self):
-        """Minimize Firefox windows (Windows only)"""
-        if sys.platform != "win32":
-            return
-        
-        def callback(hwnd, _):
-            title = win32gui.GetWindowText(hwnd)
-            if "Mozilla Firefox" in title:
-                win32gui.ShowWindow(hwnd, win32con.SW_FORCEMINIMIZE)
-        
-        win32gui.EnumWindows(callback, None)
     
     # ========================================================================
     # MESSAGE SENDING
@@ -1573,16 +1824,35 @@ class IBotAutomation:
             
             try:
                 if driver is None:
-                    # Check if profile is already open and being used by another campaign
-                    if profile_path in self.open_profiles:
-                        safe_print(f"Profile {profile['profile_name']} is already open and being used by another campaign", "ℹ️", "INFO")
-                        safe_print(f"Skipping profile {profile['profile_name']} to avoid conflicts", "⏭️", "INFO")
-                        return  # Skip this profile entirely
+                    # Thread-safe check and mark as opening
+                    with self.profile_lock:
+                        # Check if profile is already open or being opened
+                        if profile_path in self.open_profiles:
+                            # Double-check if it's actually open
+                            if self._is_profile_already_open(profile_path):
+                                safe_print(f"Profile {profile['profile_name']} is already open and being used by another campaign", "ℹ️", "INFO")
+                                safe_print(f"Skipping profile {profile['profile_name']} to avoid conflicts", "⏭️", "INFO")
+                                return  # Skip this profile entirely
+                            else:
+                                # Profile was tracked but not actually open, remove from tracking
+                                self.open_profiles.discard(profile_path)
+                        
+                        # Mark as being opened BEFORE creating driver (atomic operation)
+                        if profile_path in self.open_profiles:
+                            safe_print(f"Profile {profile['profile_name']} is already being opened by another thread", "ℹ️", "INFO")
+                            return  # Skip to avoid race condition
+                        
+                        # Add to tracking BEFORE opening
+                        self.open_profiles.add(profile_path)
                     
-                    driver = self.create_firefox_driver(profile_path)
-                    
-                    # Mark profile as open
-                    self.open_profiles.add(profile_path)
+                    # Create driver outside the lock (can take time)
+                    try:
+                        driver = self.create_firefox_driver(profile_path)
+                    except Exception as e:
+                        # If driver creation fails, remove from tracking
+                        with self.profile_lock:
+                            self.open_profiles.discard(profile_path)
+                        raise
                     
                     with self.campaign_lock:
                         if campaign_id in self.active_campaigns:
@@ -1613,6 +1883,20 @@ class IBotAutomation:
                                     except:
                                         pass
                             
+                            # Remove old driver reference but keep profile tracked
+                            try:
+                                driver.quit()
+                            except:
+                                pass
+                            driver = None
+                            
+                            # Try to restart - check if profile is still available
+                            with self.profile_lock:
+                                if profile_path not in self.open_profiles or not self._is_profile_already_open(profile_path):
+                                    # Profile is not tracked or not actually open, can restart
+                                    if profile_path not in self.open_profiles:
+                                        self.open_profiles.add(profile_path)
+                            
                             try:
                                 driver = self.create_firefox_driver(profile['profile_path'])
                                 
@@ -1621,8 +1905,15 @@ class IBotAutomation:
                                         self.active_campaigns[campaign_id]['drivers'].append(driver)
                                 
                                 safe_print(f"Restarted: {profile['profile_name']}", "✅", "SUCCESS")
-                            except Exception:
-                                raise ProfileException("Restart failed")
+                            except ProfileException as pe:
+                                # Profile might be in use by another process
+                                error_msg = str(pe).lower()
+                                if "already in use" in error_msg or "already" in error_msg:
+                                    safe_print(f"Cannot restart {profile['profile_name']}: profile is in use", "⚠️", "WARNING")
+                                    break
+                                raise
+                            except Exception as e:
+                                raise ProfileException(f"Restart failed: {str(e)[:100]}")
                         
                         current_processed = self.get_processed_recipients(campaign_id)
                         if user in current_processed:
@@ -1644,15 +1935,30 @@ class IBotAutomation:
                             except:
                                 pass
                     
-                    # Remove profile from open profiles tracking
-                    self.open_profiles.discard(profile_path)
-                    driver.quit()
+                    try:
+                        driver.quit()
+                    except:
+                        pass
                     driver = None
+                    
+                    # Remove profile from open profiles tracking (thread-safe)
+                    with self.profile_lock:
+                        self.open_profiles.discard(profile_path)
                 
                 break
                 
-            except ProfileException:
+            except ProfileException as pe:
                 retry_count += 1
+                
+                # Check if profile is actually in use (not just a temporary error)
+                error_msg = str(pe).lower()
+                if "already in use" in error_msg or "already" in error_msg or "in use" in error_msg:
+                    # Profile is actually in use, skip it
+                    with self.profile_lock:
+                        # Keep it in tracking since it's actually open
+                        self.open_profiles.add(profile_path)
+                    safe_print(f"Profile {profile['profile_name']} is already in use, skipping", "ℹ️", "INFO")
+                    break
                 
                 if driver:
                     try:
@@ -1662,16 +1968,18 @@ class IBotAutomation:
                                     self.active_campaigns[campaign_id]['drivers'].remove(driver)
                                 except:
                                     pass
-                        # Remove profile from open profiles tracking
-                        self.open_profiles.discard(profile_path)
                         driver.quit()
                     except:
                         pass
                     driver = None
+                    
+                    # Remove profile from open profiles tracking (thread-safe)
+                    with self.profile_lock:
+                        self.open_profiles.discard(profile_path)
                 
                 if retry_count < max_retries:
                     delay = exponential_backoff(retry_count - 1)
-                    safe_print(f"Retrying in {int(delay)}s...", "🔄", "INFO")
+                    safe_print(f"Retrying profile {profile['profile_name']} in {int(delay)}s...", "🔄", "INFO")
                     time.sleep(delay)
                 
             except Exception:
@@ -1685,11 +1993,13 @@ class IBotAutomation:
                             self.active_campaigns[campaign_id]['drivers'].remove(driver)
                         except:
                             pass
-                # Remove profile from open profiles tracking
-                self.open_profiles.discard(profile_path)
                 driver.quit()
             except:
                 pass
+            
+            # Remove profile from open profiles tracking (thread-safe)
+            with self.profile_lock:
+                self.open_profiles.discard(profile_path)
     
     # ========================================================================
     # CAMPAIGN EXECUTION
@@ -1793,6 +2103,10 @@ class IBotAutomation:
     def monitor_campaigns(self):
         """Monitor and manage campaigns and unread check requests"""
         safe_print("Starting monitoring for campaigns and unread checks...", "🔄", "INFO")
+        if self.ws_connected:
+            safe_print("Using WebSocket for real-time updates", "✅", "INFO")
+        else:
+            safe_print("Using polling mode (WebSocket unavailable)", "⚠️", "WARNING")
         safe_print("Press Ctrl+C to stop", "💡", "INFO")
         safe_print("=" * 70, "ℹ️", "INFO")
         
@@ -1800,140 +2114,148 @@ class IBotAutomation:
         
         while not self.global_stop:
             try:
-                # Check for campaigns
-                running_campaigns = self.get_running_campaigns()
-                running_campaign_ids = {c['id'] for c in running_campaigns}
+                # Reconnect WebSocket if needed
+                if not self.ws_connected:
+                    self._reconnect_websocket()
                 
-                with self.campaign_lock:
-                    active_campaign_ids = set(self.active_campaigns.keys())
-                
-                stopped_campaigns = active_campaign_ids - running_campaign_ids
-                if stopped_campaigns:
-                    safe_print(f"Stopped campaigns: {stopped_campaigns}", "⚠️", "WARNING")
+                # If WebSocket is connected, rely on events. Otherwise, fall back to polling
+                if not self.ws_connected:
+                    # Polling fallback mode
+                    # Check for campaigns
+                    running_campaigns = self.get_running_campaigns()
+                    running_campaign_ids = {c['id'] for c in running_campaigns}
                     
-                    for campaign_id in stopped_campaigns:
-                        with self.campaign_lock:
-                            if campaign_id in self.active_campaigns:
-                                self.active_campaigns[campaign_id]['stop'] = True
+                    with self.campaign_lock:
+                        active_campaign_ids = set(self.active_campaigns.keys())
+                    
+                    stopped_campaigns = active_campaign_ids - running_campaign_ids
+                    if stopped_campaigns:
+                        safe_print(f"Stopped campaigns: {stopped_campaigns}", "⚠️", "WARNING")
                         
-                        self.close_campaign_profiles(campaign_id)
-                
-                new_campaigns = running_campaign_ids - active_campaign_ids
-                if new_campaigns:
-                    safe_print(f"New campaigns: {len(new_campaigns)}", "📊", "INFO")
-                    
-                    for campaign in running_campaigns:
-                        if campaign['id'] in new_campaigns:
-                            safe_print(f"Starting: {campaign['name']}", "🚀", "INFO")
-                            
-                            thread = threading.Thread(
-                                target=self.run_campaign_thread,
-                                args=(campaign['id'],)
-                            )
-                            thread.daemon = True
-                            thread.start()
-                            
+                        for campaign_id in stopped_campaigns:
                             with self.campaign_lock:
-                                self.active_campaigns[campaign['id']] = {
-                                    'thread': thread,
-                                    'drivers': [],
-                                    'stop': False
-                                }
-                
-                # Check for unread check requests
-                try:
-                    pending_unread_requests = self.get_pending_unread_requests()
-                    if pending_unread_requests:
-                        safe_print(f"Found {len(pending_unread_requests)} unread check request(s)", "📬", "INFO")
+                                if campaign_id in self.active_campaigns:
+                                    self.active_campaigns[campaign_id]['stop'] = True
+                            
+                            self.close_campaign_profiles(campaign_id)
+                    
+                    new_campaigns = running_campaign_ids - active_campaign_ids
+                    if new_campaigns:
+                        safe_print(f"New campaigns: {len(new_campaigns)}", "📊", "INFO")
                         
-                        for request in pending_unread_requests:
-                            safe_print(f"Processing unread check request {request['id']}", "📬", "INFO")
+                        for campaign in running_campaigns:
+                            if campaign['id'] in new_campaigns:
+                                self._handle_campaign_start(campaign['id'])
+                    
+                    # Check for unread check requests
+                    try:
+                        pending_unread_requests = self.get_pending_unread_requests()
+                        if pending_unread_requests:
+                            safe_print(f"Found {len(pending_unread_requests)} unread check request(s)", "📬", "INFO")
                             
-                            # Execute unread check in a separate thread
-                            thread = threading.Thread(
-                                target=self.execute_unread_check,
-                                args=(request['id'], request.get('profile_ids'))
-                            )
-                            thread.daemon = True
-                            thread.start()
-                except Exception as e:
-                    safe_print(f"Error checking unread requests: {str(e)}", "⚠️", "WARNING")
-                
-                # Check for profile opening requests
-                pending_profile_requests = []
-                try:
-                    pending_profile_requests = self.get_pending_profile_requests()
-                    if pending_profile_requests:
-                        safe_print(f"Found {len(pending_profile_requests)} profile opening request(s)", "🦊", "INFO")
-                        
-                        for request in pending_profile_requests:
-                            request_id = request['id']
+                            for request in pending_unread_requests:
+                                safe_print(f"Processing unread check request {request['id']}", "📬", "INFO")
+                                
+                                # Execute unread check in a separate thread
+                                thread = threading.Thread(
+                                    target=self.execute_unread_check,
+                                    args=(request['id'], request.get('profile_ids'))
+                                )
+                                thread.daemon = True
+                                thread.start()
+                    except Exception as e:
+                        safe_print(f"Error checking unread requests: {str(e)}", "⚠️", "WARNING")
+                    
+                    # Check for profile opening requests
+                    pending_profile_requests = []
+                    try:
+                        pending_profile_requests = self.get_pending_profile_requests()
+                        if pending_profile_requests:
+                            safe_print(f"Found {len(pending_profile_requests)} profile opening request(s)", "🦊", "INFO")
                             
-                            # Skip if already processed
-                            if request_id in self.processed_requests:
-                                safe_print(f"Skipping already processed request {request_id}", "⏭️", "INFO")
-                                continue
+                            for request in pending_profile_requests:
+                                request_id = request['id']
+                                
+                                # Skip if already processed
+                                if request_id in self.processed_requests:
+                                    safe_print(f"Skipping already processed request {request_id}", "⏭️", "INFO")
+                                    continue
+                                
+                                safe_print(f"Processing profile request {request_id} ({request.get('request_type', 'open')})", "🦊", "INFO")
+                                
+                                # Mark as being processed
+                                self.processed_requests.add(request_id)
+                                
+                                # Execute profile request in a separate thread
+                                thread = threading.Thread(
+                                    target=self.execute_profile_request,
+                                    args=(request_id, request.get('profile_path'), request.get('profile_name'), request.get('request_type', 'open'))
+                                )
+                                thread.daemon = True
+                                thread.start()
+                    except Exception as e:
+                        safe_print(f"Error checking profile requests: {str(e)}", "⚠️", "WARNING")
+                    
+                    # Check for Firefox profile requests
+                    pending_firefox_profile_requests = []
+                    try:
+                        pending_firefox_profile_requests = self.get_pending_firefox_profile_requests()
+                        if pending_firefox_profile_requests:
+                            safe_print(f"Found {len(pending_firefox_profile_requests)} Firefox profile request(s)", "🦊", "INFO")
                             
-                            safe_print(f"Processing profile request {request_id} ({request.get('request_type', 'open')})", "🦊", "INFO")
-                            
-                            # Mark as being processed
-                            self.processed_requests.add(request_id)
-                            
-                            # Execute profile request in a separate thread
-                            thread = threading.Thread(
-                                target=self.execute_profile_request,
-                                args=(request_id, request.get('profile_path'), request.get('profile_name'), request.get('request_type', 'open'))
-                            )
-                            thread.daemon = True
-                            thread.start()
-                except Exception as e:
-                    safe_print(f"Error checking profile requests: {str(e)}", "⚠️", "WARNING")
-                
-                # Check for Firefox profile requests
-                pending_firefox_profile_requests = []
-                try:
-                    pending_firefox_profile_requests = self.get_pending_firefox_profile_requests()
-                    if pending_firefox_profile_requests:
-                        safe_print(f"Found {len(pending_firefox_profile_requests)} Firefox profile request(s)", "🦊", "INFO")
-                        
-                        for request in pending_firefox_profile_requests:
-                            request_id = request['id']
-                            
-                            # Skip if already processed
-                            if request_id in self.processed_requests:
-                                safe_print(f"Skipping already processed Firefox profile request {request_id}", "⏭️", "INFO")
-                                continue
-                            
-                            safe_print(f"Processing Firefox profile request {request_id} ({request.get('request_type')})", "🦊", "INFO")
-                            
-                            # Mark as being processed
-                            self.processed_requests.add(request_id)
-                            
-                            # Execute Firefox profile request in a separate thread
-                            thread = threading.Thread(
-                                target=self.execute_firefox_profile_request,
-                                args=(request_id, request.get('request_type'), request.get('profile_name'), request.get('profile_path'), request.get('is_default', False))
-                            )
-                            thread.daemon = True
-                            thread.start()
-                except Exception as e:
-                    safe_print(f"Error checking Firefox profile requests: {str(e)}", "⚠️", "WARNING")
-                
-                # Cleanup processed requests every 10 cycles to prevent memory buildup
-                self.request_cleanup_counter += 1
-                if self.request_cleanup_counter >= 10:
-                    self.processed_requests.clear()
-                    self.request_cleanup_counter = 0
-                
-                if not running_campaigns and not pending_unread_requests and not pending_profile_requests and not pending_firefox_profile_requests:
-                    safe_print("No active campaigns, unread check requests, profile requests, or Firefox profile requests", "⏳", "INFO")
+                            for request in pending_firefox_profile_requests:
+                                request_id = request['id']
+                                
+                                # Skip if already processed
+                                if request_id in self.processed_requests:
+                                    safe_print(f"Skipping already processed Firefox profile request {request_id}", "⏭️", "INFO")
+                                    continue
+                                
+                                safe_print(f"Processing Firefox profile request {request_id} ({request.get('request_type')})", "🦊", "INFO")
+                                
+                                # Mark as being processed
+                                self.processed_requests.add(request_id)
+                                
+                                # Execute Firefox profile request in a separate thread
+                                thread = threading.Thread(
+                                    target=self.execute_firefox_profile_request,
+                                    args=(request_id, request.get('request_type'), request.get('profile_name'), request.get('profile_path'), request.get('is_default', False))
+                                )
+                                thread.daemon = True
+                                thread.start()
+                    except Exception as e:
+                        safe_print(f"Error checking Firefox profile requests: {str(e)}", "⚠️", "WARNING")
+                    
+                    # Cleanup processed requests every 10 cycles to prevent memory buildup
+                    self.request_cleanup_counter += 1
+                    if self.request_cleanup_counter >= 10:
+                        self.processed_requests.clear()
+                        self.request_cleanup_counter = 0
+                    
+                    if not running_campaigns and not pending_unread_requests and not pending_profile_requests and not pending_firefox_profile_requests:
+                        safe_print("No active campaigns, unread check requests, profile requests, or Firefox profile requests", "⏳", "INFO")
+                    else:
+                        with self.campaign_lock:
+                            active_count = len(self.active_campaigns)
+                        safe_print(f"Processing {active_count} campaign(s), unread checks, profile requests, and Firefox profile requests", "📊", "INFO")
+                    
+                    consecutive_errors = 0
+                    time.sleep(Config.MONITOR_INTERVAL)
                 else:
+                    # WebSocket mode - just keep connection alive and handle events
                     with self.campaign_lock:
                         active_count = len(self.active_campaigns)
-                    safe_print(f"Processing {active_count} campaign(s), unread checks, profile requests, and Firefox profile requests", "📊", "INFO")
-                
-                consecutive_errors = 0
-                time.sleep(Config.MONITOR_INTERVAL)
+                    if active_count > 0:
+                        safe_print(f"Active: {active_count} campaign(s) (WebSocket mode)", "📊", "INFO")
+                    
+                    # Cleanup processed requests periodically
+                    self.request_cleanup_counter += 1
+                    if self.request_cleanup_counter >= 10:
+                        self.processed_requests.clear()
+                        self.request_cleanup_counter = 0
+                    
+                    # Sleep shorter in WebSocket mode since we're event-driven
+                    time.sleep(10)
             
             except TokenExpiredException:
                 safe_print("Token expired", "❌", "ERROR")
@@ -1967,6 +2289,13 @@ class IBotAutomation:
         with self.campaign_lock:
             for campaign_id in list(self.active_campaigns.keys()):
                 self.close_campaign_profiles(campaign_id)
+        
+        # Disconnect WebSocket
+        if self.sio and self.sio.connected:
+            try:
+                self.sio.disconnect()
+            except:
+                pass
         
         safe_print("Monitoring stopped", "✅", "INFO")
 
