@@ -58,8 +58,9 @@ class AgentApp(tk.Tk):
 
         self.connect_btn = tk.Button(
             btn_frame, text="Connect & Run",
-            command=self.on_connect, bg="#22C55E", activebackground="#22C55E",
-            fg="white", relief="flat", bd=0, padx=22, pady=10, font=("SF Pro Text", 12, "bold"))
+            command=self.on_connect, bg="#10B981", activebackground="#059669",
+            fg="white", relief="flat", bd=0, padx=22, pady=10, font=("SF Pro Text", 12, "bold"),
+            cursor="hand2")
         self.connect_btn.grid(row=0, column=0, padx=10)
 
         self.stop_btn = tk.Button(
@@ -141,6 +142,12 @@ class AgentApp(tk.Tk):
         self._toggle_running(True)
         self.proc_thread = threading.Thread(target=self._engine_loop, args=(token,), daemon=True)
         self.proc_thread.start()
+        
+        # Hide the window after successful connection
+        self._set_status("Connected - Window minimizing...")
+        self.update_idletasks()
+        # Small delay to show status message
+        self.after(500, self._hide_window)
 
     def on_stop(self):
         # Engine monitors KeyboardInterrupt / flags internally; safest is to exit the app
@@ -162,6 +169,16 @@ class AgentApp(tk.Tk):
         # Common macOS install location after "brew install geckodriver"
         candidates = ["/usr/local/bin/geckodriver", "/opt/homebrew/bin/geckodriver", "/usr/bin/geckodriver"]
         return any(os.path.exists(p) for p in candidates)
+    
+    def _hide_window(self):
+        """Hide the window after successful connection"""
+        try:
+            # Withdraw the window (hides it but keeps the app running)
+            self.withdraw()
+            # Alternatively, you can use iconify() to minimize to dock
+            # self.iconify()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     app = AgentApp()
